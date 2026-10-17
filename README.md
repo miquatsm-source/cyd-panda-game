@@ -1,16 +1,16 @@
 # CYD Panda Game
 
-A small touchscreen game for an ESP32-based CYD board. Guide the green panda
-across a grassy field, collect bread, and avoid the red bugs chasing you. The
-field contains walls, the bugs move on their own, and a buzzer plays sound
+A small touchscreen game for an ESP32-based CYD board. Guide panda
+across a grassy field, collect bread, and avoid beens chasing you. The
+field contains walls, the bees move on their own, and a buzzer plays sound
 effects and music.
 
 ## How to play
 
-- Tap the screen to send the green panda toward that position.
+- Tap the screen to send panda toward that position.
 - Collect 21 pieces of bread to win.
-- Avoid the red bugs. More red bugs join the chase as bread is collected.
-- Bread can also be collected by a red bug; every pickup advances the counter.
+- Avoid the bees. More bees join the chase as bread is collected.
+- Bread can also be collected by bees; every pickup by panda advances the counter.
 - Use the `-` and `+` controls in the upper-right corner to change the volume.
 - If caught, tap **New Game** to start over.
 
@@ -27,7 +27,7 @@ specifications before uploading: this project uses the ST7789 setup in
 `include/cyd_user_setup.h`. A board with a different display controller may
 need a matching TFT_eSPI setup before the display will work.
 
-## Install and upload
+## Install and upload (following text is created using AI)
 
 ### 1. Install the tools
 
