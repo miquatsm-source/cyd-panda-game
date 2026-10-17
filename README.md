@@ -1,20 +1,28 @@
 # CYD Panda Game
 
-A small touchscreen game for an ESP32-based CYD board. Guide panda
-across a grassy field, collect bread, and avoid beens chasing you. The
-field contains walls, the bees move on their own, and a buzzer plays sound
-effects and music.
+A small touchscreen game for an ESP32-based CYD board. Guide the panda across
+a grassy field, collect bread, and avoid a growing group of animal and
+stone-age pursuers. The field contains walls, each enemy has its own animation
+and movement style, and a buzzer plays sound effects and music.
 
 ![CYD Panda Game](CYD_panda_game.png)
 
 ## How to play
 
-- Tap the screen to send panda toward that position.
-- Collect 21 pieces of bread to win.
-- Avoid the bees. More bees join the chase as bread is collected.
-- Bread can also be collected by bees; every pickup by panda advances the counter.
-- Use the `-` and `+` controls in the upper-right corner to change the volume.
-- If caught, tap **New Game** to start over.
+- Choose **Classic** or **Endless** from the main menu.
+- Tap the screen to send the panda toward that position.
+- Only the panda can collect bread. Each piece adds four seconds to its speed
+  boost, shown by a cyan glow and speed streaks.
+- In Classic mode, collect 21 pieces of bread to win.
+- In Endless mode, collect as much bread as possible; the run ends when the
+  panda is caught. Your best Endless score is saved on the CYD.
+- Avoid the bee, fox, skunk, snake, and stone-age pursuers. A new enemy type
+  joins every four pieces of bread collected, up to five enemies total.
+- The fox makes short sprints, the skunk releases a slowing stink cloud, the
+  snake lunges, and the stone-age pursuer steadily follows.
+- Only bread collected by the panda advances the counter.
+- Adjust the volume with the `-` and `+` controls in the upper-right corner.
+- After a round, tap **Menu** to choose a mode again.
 
 ## Hardware
 

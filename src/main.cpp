@@ -3,6 +3,7 @@
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
+#include <string.h>
 
 TFT_eSPI tft = TFT_eSPI();
 SPIClass touchSPI(HSPI);
@@ -23,21 +24,35 @@ uint32_t lastPandaAnimationAt = 0;
 bool caught = false;
 bool awaitingRestart = false;
 bool gameWon = false;
-uint16_t crumbsCollected = 0;
+enum class GameMode : uint8_t { Classic, Endless };
+GameMode gameMode = GameMode::Classic;
+bool inMainMenu = true;
+uint32_t crumbsCollected = 0;
+uint32_t endlessHighScore = 0;
 uint32_t greenBoostUntil = 0;
-constexpr uint8_t MAX_RED_BUGS = 4;
-constexpr int16_t RED_BUG_MIN_DX = 36;
-constexpr int16_t RED_BUG_MIN_DY = 30;
-constexpr int8_t RED_BUG_TARGET_OFFSET_X[MAX_RED_BUGS] = {0, -16, 14, 0};
-constexpr int8_t RED_BUG_TARGET_OFFSET_Y[MAX_RED_BUGS] = {0, 12, -14, 20};
-struct RedBug {
+bool greenFacingRight = true;
+bool pandaBoostVisualActive = false;
+enum class EnemyType : uint8_t { Bee, Fox, Skunk, Snake, Caveman };
+constexpr uint8_t MAX_ENEMIES = 5;
+constexpr int16_t ENEMY_MIN_DX = 36;
+constexpr int16_t ENEMY_MIN_DY = 30;
+constexpr int8_t ENEMY_TARGET_OFFSET_X[MAX_ENEMIES] = {0, -16, 14, 0, -10};
+constexpr int8_t ENEMY_TARGET_OFFSET_Y[MAX_ENEMIES] = {0, 12, -14, 20, 0};
+struct Enemy {
   int16_t x;
   int16_t y;
   uint32_t lastMove;
+  uint32_t lastAnimationAt;
   uint32_t boostUntil;
+  uint32_t specialUntil;
+  uint32_t nextSpecialAt;
+  uint8_t animationFrame;
+  EnemyType type;
+  bool specialActive;
+  bool facingRight;
 };
-RedBug redBugs[MAX_RED_BUGS];
-uint8_t redBugCount = 1;
+Enemy enemies[MAX_ENEMIES];
+uint8_t enemyCount = 1;
 constexpr uint8_t CRUMB_COUNT = 3;
 struct Crumb {
   int16_t x;
@@ -46,6 +61,7 @@ struct Crumb {
 };
 Crumb crumbs[CRUMB_COUNT];
 void placeCrumb(Crumb &crumb);
+void drawMeadowPatch(int16_t x, int16_t y, int16_t width, int16_t height);
 
 struct Wall {
   int16_t x;
@@ -96,7 +112,7 @@ void playSpeakerTone(uint16_t frequency, uint16_t durationMs = 0) {
   }
 
   if (ledcWriteTone(BUZZER_CHANNEL, frequency) == 0) {
-    Serial.println("FEHLER: Lautsprecherton konnte nicht gestartet werden.");
+    Serial.println("ERROR: Could not start speaker tone.");
     return;
   }
 
@@ -111,16 +127,19 @@ void updateSpeaker() {
   }
 }
 
+int16_t spriteX(int16_t x, int16_t offset, bool facingRight) {
+  return x + (facingRight ? offset : -offset);
+}
+
 void drawVolumeControls() {
-  tft.fillRect(tft.width() - 126, 0, 126, 24, TFT_BLACK);
-  tft.drawRoundRect(tft.width() - 124, 2, 24, 20, 4, TFT_WHITE);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  drawMeadowPatch(tft.width() - 126, 0, 126, 24);
+  tft.drawRect(tft.width() - 126, 0, 126, 24, TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
   tft.setTextSize(1);
   tft.setCursor(tft.width() - 116, 8);
   tft.print("-");
   tft.setCursor(tft.width() - 96, 8);
   tft.printf("%u%%", volumePercent);
-  tft.drawRoundRect(tft.width() - 48, 2, 24, 20, 4, TFT_WHITE);
   tft.setCursor(tft.width() - 40, 8);
   tft.print("+");
 }
@@ -140,16 +159,28 @@ bool handleVolumeTouch(int16_t x, int16_t y) {
 
   drawVolumeControls();
   preferences.putUChar("volume", volumePercent);
-  Serial.printf("Lautstaerke: %u%%\n", volumePercent);
+  Serial.printf("Volume: %u%%\n", volumePercent);
   playSpeakerTone(1000, 90);
   return true;
 }
 
-void drawPanda(int16_t x, int16_t y, uint8_t frame = 0) {
+void drawPanda(int16_t x, int16_t y, uint8_t frame, bool facingRight,
+               bool boosted) {
   const uint16_t black = tft.color565(20, 20, 24);
   const uint16_t white = TFT_WHITE;
   const uint16_t outline = tft.color565(155, 155, 165);
   const int8_t stride = frame % 2 == 0 ? -2 : 2;
+
+  if (boosted) {
+    const uint16_t glow = tft.color565(80, 230, 255);
+    tft.drawCircle(x, y - 4, 17, glow);
+    tft.drawFastHLine(spriteX(x, -25, facingRight), y - 7, 7, glow);
+    tft.drawFastHLine(spriteX(x, -29, facingRight), y, 9, glow);
+    tft.drawFastHLine(spriteX(x, -24, facingRight), y + 7, 6, glow);
+    const int8_t sparkleOffset = frame % 2 == 0 ? 1 : 3;
+    tft.fillCircle(spriteX(x, 13, facingRight), y - 16 - sparkleOffset, 2,
+                   TFT_YELLOW);
+  }
 
   tft.fillEllipse(x, y + 6, 9, 7, black);
   tft.fillEllipse(x, y + 5, 7, 6, white);
@@ -163,38 +194,180 @@ void drawPanda(int16_t x, int16_t y, uint8_t frame = 0) {
   tft.fillCircle(x, y - 5, 9, white);
   tft.fillEllipse(x - 4, y - 6, 3, 5, black);
   tft.fillEllipse(x + 4, y - 6, 3, 5, black);
-  tft.fillCircle(x - 4, y - 6, 1, white);
-  tft.fillCircle(x + 4, y - 6, 1, white);
+  const int8_t gazeOffset = facingRight ? 1 : -1;
+  tft.fillCircle(x - 4 + gazeOffset, y - 6, 1, white);
+  tft.fillCircle(x + 4 + gazeOffset, y - 6, 1, white);
   tft.fillEllipse(x, y - 1, 4, 3, white);
   tft.fillCircle(x, y - 2, 2, black);
   tft.drawLine(x, y, x - 2, y + 1, black);
   tft.drawLine(x, y, x + 2, y + 1, black);
   const int16_t leftFootY = y + (frame % 2 == 0 ? 11 : 15);
   const int16_t rightFootY = y + (frame % 2 == 0 ? 15 : 11);
-  tft.drawLine(x - 6, y + 8, x - 9 + stride, leftFootY, black);
-  tft.drawLine(x + 6, y + 8, x + 9 - stride, rightFootY, black);
-  tft.fillEllipse(x - 9 + stride, leftFootY, 5, 4, black);
-  tft.fillEllipse(x + 9 - stride, rightFootY, 5, 4, black);
+  tft.drawLine(spriteX(x, -6, facingRight), y + 8,
+               spriteX(x, -9 + stride, facingRight), leftFootY, black);
+  tft.drawLine(spriteX(x, 6, facingRight), y + 8,
+               spriteX(x, 9 - stride, facingRight), rightFootY, black);
+  tft.fillEllipse(spriteX(x, -9 + stride, facingRight), leftFootY, 5, 4, black);
+  tft.fillEllipse(spriteX(x, 9 - stride, facingRight), rightFootY, 5, 4, black);
 }
 
-void drawBee(int16_t x, int16_t y) {
+void drawBee(int16_t x, int16_t y, uint8_t frame, bool facingRight) {
   const uint16_t yellow = tft.color565(255, 205, 35);
   const uint16_t wing = tft.color565(190, 225, 255);
   const uint16_t black = TFT_BLACK;
 
-  tft.fillEllipse(x - 2, y - 7, 5, 4, wing);
-  tft.fillEllipse(x + 5, y - 7, 5, 4, wing);
-  tft.drawLine(x - 8, y + 5, x - 11, y + 10, black);
-  tft.drawLine(x, y + 6, x - 1, y + 11, black);
-  tft.drawLine(x + 7, y + 3, x + 9, y + 9, black);
+  tft.fillEllipse(x - 2, y - 7 + (frame % 2), 5, 4, wing);
+  tft.fillEllipse(x + 5, y - 7 - (frame % 2), 5, 4, wing);
+  tft.drawLine(spriteX(x, -8, facingRight), y + 5,
+               spriteX(x, -11, facingRight), y + 10, black);
+  tft.drawLine(x, y + 6, spriteX(x, -1, facingRight), y + 11, black);
+  tft.drawLine(spriteX(x, 7, facingRight), y + 3,
+               spriteX(x, 9, facingRight), y + 9, black);
   tft.fillEllipse(x, y, 11, 7, yellow);
-  tft.drawFastVLine(x - 5, y - 6, 13, black);
-  tft.drawFastVLine(x + 1, y - 7, 15, black);
-  tft.drawFastVLine(x + 7, y - 5, 11, black);
-  tft.fillCircle(x + 10, y - 1, 5, yellow);
-  tft.drawLine(x + 9, y - 5, x + 7, y - 10, black);
-  tft.drawLine(x + 12, y - 5, x + 14, y - 10, black);
-  tft.fillCircle(x + 11, y - 2, 1, black);
+  tft.drawFastVLine(spriteX(x, -5, facingRight), y - 6, 13, black);
+  tft.drawFastVLine(spriteX(x, 1, facingRight), y - 7, 15, black);
+  tft.drawFastVLine(spriteX(x, 7, facingRight), y - 5, 11, black);
+  tft.fillCircle(spriteX(x, 10, facingRight), y - 1, 5, yellow);
+  tft.drawLine(spriteX(x, 9, facingRight), y - 5,
+               spriteX(x, 7, facingRight), y - 10, black);
+  tft.drawLine(spriteX(x, 12, facingRight), y - 5,
+               spriteX(x, 14, facingRight), y - 10, black);
+  tft.fillCircle(spriteX(x, 11, facingRight), y - 2, 1, black);
+}
+
+void drawFox(int16_t x, int16_t y, uint8_t frame, bool sprinting, bool facingRight) {
+  const uint16_t orange = tft.color565(230, 105, 35);
+  const uint16_t cream = tft.color565(255, 225, 175);
+  const uint16_t black = tft.color565(45, 35, 30);
+  const int8_t wag = frame % 2 == 0 ? -3 : 3;
+  tft.fillEllipse(spriteX(x, -11, facingRight), y + wag, 9, 5, orange);
+  tft.fillCircle(spriteX(x, -18, facingRight), y + wag - 1, 3, cream);
+  tft.fillEllipse(x, y + 3, 10, 7, orange);
+  tft.fillCircle(spriteX(x, 7, facingRight), y - 5, 8, orange);
+  tft.fillTriangle(spriteX(x, 1, facingRight), y - 9,
+                   spriteX(x, 3, facingRight), y - 19,
+                   spriteX(x, 9, facingRight), y - 9, black);
+  tft.fillTriangle(spriteX(x, 9, facingRight), y - 10,
+                   spriteX(x, 15, facingRight), y - 18,
+                   spriteX(x, 15, facingRight), y - 5, black);
+  tft.fillCircle(spriteX(x, 12, facingRight), y - 4, 2, cream);
+  tft.fillCircle(spriteX(x, 9, facingRight), y - 6, 1, black);
+  tft.fillEllipse(spriteX(x, 13, facingRight), y - 1, 5, 3, cream);
+  tft.fillCircle(spriteX(x, 17, facingRight), y - 2, 2, black);
+  const int8_t stride = frame % 2 == 0 ? -2 : 2;
+  tft.drawLine(spriteX(x, -5, facingRight), y + 7,
+               spriteX(x, -7 + stride, facingRight), y + 13, black);
+  tft.drawLine(spriteX(x, 4, facingRight), y + 7,
+               spriteX(x, 6 - stride, facingRight), y + 13, black);
+  if (sprinting) {
+    tft.drawFastHLine(spriteX(x, -30, facingRight), y - 5, 7, cream);
+    tft.drawFastHLine(spriteX(x, -33, facingRight), y + 1, 8, cream);
+  }
+}
+
+void drawSkunk(int16_t x, int16_t y, uint8_t frame, bool cloudActive, bool facingRight) {
+  const uint16_t black = tft.color565(35, 38, 45);
+  const uint16_t white = tft.color565(240, 240, 225);
+  const uint16_t pink = tft.color565(240, 135, 145);
+  const int8_t tailLift = frame % 2 == 0 ? 0 : 3;
+  tft.fillEllipse(spriteX(x, -8, facingRight), y - 6 - tailLift, 5, 12, black);
+  tft.drawLine(spriteX(x, -9, facingRight), y - 15 - tailLift,
+               spriteX(x, -7, facingRight), y - 3, white);
+  tft.fillEllipse(x, y + 3, 11, 7, black);
+  tft.fillCircle(spriteX(x, 7, facingRight), y - 5, 7, black);
+  tft.drawLine(spriteX(x, 6, facingRight), y - 11,
+               spriteX(x, 4, facingRight), y - 2, white);
+  tft.fillTriangle(spriteX(x, 3, facingRight), y - 10,
+                   spriteX(x, 1, facingRight), y - 17,
+                   spriteX(x, 8, facingRight), y - 11, black);
+  tft.fillTriangle(spriteX(x, 9, facingRight), y - 10,
+                   spriteX(x, 13, facingRight), y - 16,
+                   spriteX(x, 13, facingRight), y - 8, black);
+  tft.fillCircle(spriteX(x, 13, facingRight), y - 3, 2, pink);
+  tft.fillCircle(spriteX(x, 9, facingRight), y - 6, 1, white);
+  tft.drawLine(spriteX(x, -5, facingRight), y + 8,
+               spriteX(x, -7, facingRight), y + 13, black);
+  tft.drawLine(spriteX(x, 5, facingRight), y + 8,
+               spriteX(x, 7, facingRight), y + 13, black);
+  if (cloudActive) {
+    const uint16_t cloud = tft.color565(155, 185, 105);
+    tft.fillCircle(spriteX(x, 16, facingRight), y - 17, 5, cloud);
+    tft.fillCircle(spriteX(x, 22, facingRight), y - 20, 6, cloud);
+    tft.fillCircle(spriteX(x, 27, facingRight), y - 14, 5, cloud);
+  }
+}
+
+void drawSnake(int16_t x, int16_t y, uint8_t frame, bool lunging, bool facingRight) {
+  const uint16_t green = tft.color565(65, 175, 90);
+  const uint16_t lightGreen = tft.color565(145, 215, 115);
+  const uint16_t darkGreen = tft.color565(35, 105, 60);
+  const int8_t wiggle = frame % 2 == 0 ? -4 : 4;
+  tft.fillCircle(spriteX(x, -12, facingRight), y + wiggle, 5, green);
+  tft.fillCircle(spriteX(x, -5, facingRight), y - wiggle, 5, green);
+  tft.fillCircle(spriteX(x, 2, facingRight), y + wiggle, 5, green);
+  tft.fillCircle(spriteX(x, 9, facingRight), y - wiggle, 5, green);
+  tft.fillCircle(spriteX(x, 15, facingRight), y - 2, 7, green);
+  tft.fillCircle(spriteX(x, 13, facingRight), y - 4, 2, lightGreen);
+  tft.fillCircle(spriteX(x, 14, facingRight), y - 4, 1, darkGreen);
+  if (lunging || frame % 3 == 0) {
+    tft.drawLine(spriteX(x, 20, facingRight), y,
+                 spriteX(x, 24, facingRight), y + 2, tft.color565(240, 70, 90));
+    tft.drawLine(spriteX(x, 24, facingRight), y + 2,
+                 spriteX(x, 26, facingRight), y, tft.color565(240, 70, 90));
+  }
+}
+
+void drawCaveman(int16_t x, int16_t y, uint8_t frame, bool facingRight) {
+  const uint16_t skin = tft.color565(210, 155, 105);
+  const uint16_t hide = tft.color565(115, 75, 45);
+  const uint16_t hair = tft.color565(65, 45, 35);
+  const uint16_t bone = tft.color565(230, 220, 185);
+  const int8_t stride = frame % 2 == 0 ? -2 : 2;
+  tft.fillEllipse(x, y + 3, 9, 8, hide);
+  tft.fillCircle(x, y - 8, 8, skin);
+  tft.fillEllipse(x, y - 13, 9, 5, hair);
+  tft.fillCircle(x - 6, y - 9, 3, hair);
+  tft.fillCircle(x + 6, y - 9, 3, hair);
+  tft.fillCircle(x - 3, y - 8, 1, hair);
+  tft.fillCircle(x + 3, y - 8, 1, hair);
+  tft.fillCircle(spriteX(x, 4, facingRight), y - 8, 1, hair);
+  tft.drawLine(spriteX(x, -4, facingRight), y + 7,
+               spriteX(x, -6 + stride, facingRight), y + 14, hair);
+  tft.drawLine(spriteX(x, 4, facingRight), y + 7,
+               spriteX(x, 6 - stride, facingRight), y + 14, hair);
+  tft.drawLine(spriteX(x, 7, facingRight), y - 1,
+               spriteX(x, 13, facingRight), y - 8, skin);
+  tft.drawLine(spriteX(x, 13, facingRight), y - 8,
+               spriteX(x, 17, facingRight), y - 14, hair);
+  tft.fillCircle(spriteX(x, 17, facingRight), y - 14, 3, bone);
+  tft.drawLine(spriteX(x, -7, facingRight), y - 1,
+               spriteX(x, -13, facingRight), y + 4, skin);
+}
+
+void drawEnemy(const Enemy &enemy) {
+  const bool skunkCloudActive =
+      enemy.type == EnemyType::Skunk &&
+      static_cast<int32_t>(enemy.specialUntil - millis()) > 0;
+  switch (enemy.type) {
+  case EnemyType::Bee:
+    drawBee(enemy.x, enemy.y, enemy.animationFrame, enemy.facingRight);
+    break;
+  case EnemyType::Fox:
+    drawFox(enemy.x, enemy.y, enemy.animationFrame, enemy.specialActive,
+            enemy.facingRight);
+    break;
+  case EnemyType::Skunk:
+    drawSkunk(enemy.x, enemy.y, enemy.animationFrame, skunkCloudActive,
+              enemy.facingRight);
+    break;
+  case EnemyType::Snake:
+    drawSnake(enemy.x, enemy.y, enemy.animationFrame, enemy.specialActive,
+              enemy.facingRight);
+    break;
+  case EnemyType::Caveman:
+    drawCaveman(enemy.x, enemy.y, enemy.animationFrame, enemy.facingRight);
+    break;
+  }
 }
 
 void drawTarget() {
@@ -226,18 +399,25 @@ void drawCrumbs() {
 }
 
 void drawCounter() {
-  tft.fillRect(0, 0, 90, 23, TFT_BLACK);
+  drawMeadowPatch(0, 0, 108, 23);
+  tft.drawRect(0, 0, 108, 23, TFT_BLACK);
   tft.setTextSize(1);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
   tft.setCursor(4, 7);
-  tft.printf("Brot: %u/21", crumbsCollected);
+  if (gameMode == GameMode::Endless) {
+    tft.printf("Bread: %lu", static_cast<unsigned long>(crumbsCollected));
+  } else {
+    tft.printf("Bread: %lu/21", static_cast<unsigned long>(crumbsCollected));
+  }
   drawVolumeControls();
 }
 
 void drawBugs() {
-  drawPanda(greenX, greenY, pandaAnimationFrame);
-  for (uint8_t i = 0; i < redBugCount; ++i) {
-    drawBee(redBugs[i].x, redBugs[i].y);
+  const bool boosted =
+      static_cast<int32_t>(greenBoostUntil - millis()) > 0;
+  drawPanda(greenX, greenY, pandaAnimationFrame, greenFacingRight, boosted);
+  for (uint8_t i = 0; i < enemyCount; ++i) {
+    drawEnemy(enemies[i]);
   }
 }
 
@@ -274,6 +454,38 @@ void drawMeadowPatch(int16_t x, int16_t y, int16_t width, int16_t height) {
   }
 }
 
+void drawMenuOption(int16_t y, const char *label, uint16_t color) {
+  tft.fillRoundRect(55, y, 210, 42, 8, color);
+  tft.drawRoundRect(55, y, 210, 42, 8, TFT_WHITE);
+  tft.setTextColor(TFT_WHITE, color);
+  tft.setTextSize(2);
+  const int16_t textWidth = strlen(label) * 12;
+  tft.setCursor((tft.width() - textWidth) / 2, y + 13);
+  tft.print(label);
+}
+
+void showMainMenu() {
+  inMainMenu = true;
+  caught = false;
+  awaitingRestart = false;
+  gameWon = false;
+  stopSpeaker();
+  drawMeadowPatch(0, 0, tft.width(), tft.height());
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(3);
+  tft.setCursor(73, 34);
+  tft.print("PANDA GAME");
+  tft.setTextSize(1);
+  tft.setCursor(113, 72);
+  tft.print("Choose a mode");
+  drawMenuOption(92, "CLASSIC", TFT_DARKGREEN);
+  drawMenuOption(142, "ENDLESS", tft.color565(45, 95, 145));
+  tft.setTextColor(TFT_WHITE);
+  tft.setCursor(91, 197);
+  tft.printf("Endless best: %lu", static_cast<unsigned long>(endlessHighScore));
+  drawVolumeControls();
+}
+
 void drawScene() {
   drawMeadowPatch(0, 0, tft.width(), tft.height());
   drawWalls();
@@ -284,15 +496,18 @@ void drawScene() {
 }
 
 void eraseBugAt(int16_t x, int16_t y) {
-  drawMeadowPatch(x - 23, y - 22, 47, 45);
+  drawMeadowPatch(x - 36, y - 32, 72, 64);
 }
 
-void resetGame() {
+void resetGame(GameMode mode) {
+  gameMode = mode;
+  inMainMenu = false;
   greenX = 38;
   greenY = tft.height() / 2;
-  redBugCount = 1;
-  redBugs[0] = {static_cast<int16_t>(tft.width() - 38),
-                static_cast<int16_t>(tft.height() / 2), 0, 0};
+  enemyCount = 1;
+  enemies[0] = {static_cast<int16_t>(tft.width() - 38),
+                static_cast<int16_t>(tft.height() / 2), 0, 0, 0, 0, 0, 0,
+                EnemyType::Bee, false, false};
   randomizeWalls();
   targetX = greenX;
   targetY = greenY;
@@ -301,6 +516,8 @@ void resetGame() {
   gameWon = false;
   crumbsCollected = 0;
   greenBoostUntil = 0;
+  greenFacingRight = true;
+  pandaBoostVisualActive = false;
   pandaAnimationFrame = 0;
   lastPandaAnimationAt = 0;
   melodyIndex = 0;
@@ -315,7 +532,12 @@ void resetGame() {
 
 void startCaughtMelody() {
   caught = true;
+  inMainMenu = false;
   awaitingRestart = false;
+  if (gameMode == GameMode::Endless && crumbsCollected > endlessHighScore) {
+    endlessHighScore = crumbsCollected;
+    preferences.putULong("endlessBest", endlessHighScore);
+  }
   melodyIndex = 0;
   melodyNotePlaying = false;
   melodyNextAt = millis();
@@ -326,13 +548,13 @@ void startCaughtMelody() {
   tft.print("Got You!");
 }
 
-void drawRestartButton() {
+void drawMenuButton() {
   tft.fillRoundRect(55, 155, 210, 60, 10, TFT_DARKGREEN);
   tft.drawRoundRect(55, 155, 210, 60, 10, TFT_WHITE);
   tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
   tft.setTextSize(2);
-  tft.setCursor(76, 176);
-  tft.print("New Game");
+  tft.setCursor(104, 176);
+  tft.print("Menu");
 }
 
 void drawWinDance() {
@@ -341,14 +563,20 @@ void drawWinDance() {
   const uint8_t frame = winDanceFrame % 4;
   tft.fillRect(0, 70, tft.width(), 68, TFT_BLACK);
 
-  const uint8_t totalBugs = redBugCount + 1;
-  for (uint8_t i = 0; i < totalBugs; ++i) {
-    const int16_t x = 28 + (tft.width() - 56) * i / (totalBugs - 1);
+  const uint8_t totalCharacters = enemyCount + 1;
+  for (uint8_t i = 0; i < totalCharacters; ++i) {
+    const int16_t x = 28 + (tft.width() - 56) * i / (totalCharacters - 1);
     const int16_t y = danceY + offsets[(frame + i) % 4];
     if (i == 0) {
-      drawPanda(x, y, frame);
+      drawPanda(x, y, frame, true, false);
     } else {
-      drawBee(x, y);
+      Enemy dancer = enemies[i - 1];
+      dancer.x = x;
+      dancer.y = y;
+      dancer.animationFrame = frame + i;
+      dancer.specialUntil = 0;
+      dancer.facingRight = x < tft.width() / 2;
+      drawEnemy(dancer);
     }
   }
 }
@@ -389,7 +617,14 @@ void updateCaughtMelody() {
     tft.setTextSize(3);
     tft.setCursor(20, 20);
     tft.print("Got You!");
-    drawRestartButton();
+    if (gameMode == GameMode::Endless) {
+      tft.setTextSize(2);
+      tft.setCursor(65, 90);
+      tft.printf("Score: %lu", static_cast<unsigned long>(crumbsCollected));
+      tft.setCursor(48, 116);
+      tft.printf("Best: %lu", static_cast<unsigned long>(endlessHighScore));
+    }
+    drawMenuButton();
     drawVolumeControls();
     return;
   }
@@ -461,52 +696,52 @@ bool moveBugToward(int16_t &x, int16_t &y, int16_t destinationX, int16_t destina
   return false;
 }
 
-bool redBugWouldOverlap(uint8_t bugIndex, int16_t x, int16_t y) {
-  for (uint8_t i = 0; i < redBugCount; ++i) {
-    if (i == bugIndex) {
+bool enemyWouldOverlap(uint8_t enemyIndex, int16_t x, int16_t y) {
+  for (uint8_t i = 0; i < enemyCount; ++i) {
+    if (i == enemyIndex) {
       continue;
     }
-    if (abs(x - redBugs[i].x) < RED_BUG_MIN_DX &&
-        abs(y - redBugs[i].y) < RED_BUG_MIN_DY) {
+    if (abs(x - enemies[i].x) < ENEMY_MIN_DX &&
+        abs(y - enemies[i].y) < ENEMY_MIN_DY) {
       return true;
     }
   }
   return false;
 }
 
-bool moveRedBugToward(uint8_t bugIndex, int16_t destinationX, int16_t destinationY) {
-  RedBug &bug = redBugs[bugIndex];
-  const int16_t nextX = stepToward(bug.x, destinationX);
-  const int16_t nextY = stepToward(bug.y, destinationY);
-  if ((nextX != bug.x || nextY != bug.y) && !hitsWall(nextX, nextY) &&
-      !redBugWouldOverlap(bugIndex, nextX, nextY)) {
-    bug.x = nextX;
-    bug.y = nextY;
+bool moveEnemyToward(uint8_t enemyIndex, int16_t destinationX, int16_t destinationY) {
+  Enemy &enemy = enemies[enemyIndex];
+  const int16_t nextX = stepToward(enemy.x, destinationX);
+  const int16_t nextY = stepToward(enemy.y, destinationY);
+  if ((nextX != enemy.x || nextY != enemy.y) && !hitsWall(nextX, nextY) &&
+      !enemyWouldOverlap(enemyIndex, nextX, nextY)) {
+    enemy.x = nextX;
+    enemy.y = nextY;
     return true;
   }
 
-  if (nextX != bug.x && !hitsWall(nextX, bug.y) &&
-      !redBugWouldOverlap(bugIndex, nextX, bug.y)) {
-    bug.x = nextX;
+  if (nextX != enemy.x && !hitsWall(nextX, enemy.y) &&
+      !enemyWouldOverlap(enemyIndex, nextX, enemy.y)) {
+    enemy.x = nextX;
     return true;
   }
-  if (nextY != bug.y && !hitsWall(bug.x, nextY) &&
-      !redBugWouldOverlap(bugIndex, bug.x, nextY)) {
-    bug.y = nextY;
+  if (nextY != enemy.y && !hitsWall(enemy.x, nextY) &&
+      !enemyWouldOverlap(enemyIndex, enemy.x, nextY)) {
+    enemy.y = nextY;
     return true;
   }
 
   const int16_t offsetX[] = {0, 0, -1, 1};
   const int16_t offsetY[] = {-1, 1, 0, 0};
   int32_t bestDistance = INT32_MAX;
-  int16_t bestX = bug.x;
-  int16_t bestY = bug.y;
+  int16_t bestX = enemy.x;
+  int16_t bestY = enemy.y;
   bool foundStep = false;
   for (uint8_t i = 0; i < 4; ++i) {
-    const int16_t candidateX = bug.x + offsetX[i];
-    const int16_t candidateY = bug.y + offsetY[i];
+    const int16_t candidateX = enemy.x + offsetX[i];
+    const int16_t candidateY = enemy.y + offsetY[i];
     if (hitsWall(candidateX, candidateY) ||
-        redBugWouldOverlap(bugIndex, candidateX, candidateY)) {
+        enemyWouldOverlap(enemyIndex, candidateX, candidateY)) {
       continue;
     }
     const int32_t distance =
@@ -519,21 +754,21 @@ bool moveRedBugToward(uint8_t bugIndex, int16_t destinationX, int16_t destinatio
     }
   }
   if (foundStep) {
-    bug.x = bestX;
-    bug.y = bestY;
+    enemy.x = bestX;
+    enemy.y = bestY;
     return true;
   }
   return false;
 }
 
-bool findRedBugWaypoint(uint8_t bugIndex, int16_t targetX, int16_t targetY,
+bool findEnemyWaypoint(uint8_t enemyIndex, int16_t targetX, int16_t targetY,
                         int16_t &waypointX, int16_t &waypointY) {
   constexpr uint8_t columns = 36;
   constexpr uint8_t rows = 27;
   constexpr uint16_t nodeCount = columns * rows;
   static uint16_t queue[nodeCount];
   static int16_t parent[nodeCount];
-  const RedBug &bug = redBugs[bugIndex];
+  const Enemy &enemy = enemies[enemyIndex];
   const auto nodeX = [](uint16_t node) {
     return static_cast<int16_t>(20 + (node % columns) * 8);
   };
@@ -550,13 +785,13 @@ bool findRedBugWaypoint(uint8_t bugIndex, int16_t targetX, int16_t targetY,
     parent[i] = -1;
   }
 
-  uint16_t start = nearestNode(bug.x, bug.y);
+  uint16_t start = nearestNode(enemy.x, enemy.y);
   if (hitsWall(nodeX(start), nodeY(start))) {
     int32_t nearestDistance = INT32_MAX;
     for (uint16_t i = 0; i < nodeCount; ++i) {
       if (hitsWall(nodeX(i), nodeY(i))) continue;
-      const int32_t dx = bug.x - nodeX(i);
-      const int32_t dy = bug.y - nodeY(i);
+      const int32_t dx = enemy.x - nodeX(i);
+      const int32_t dy = enemy.y - nodeY(i);
       const int32_t distance = dx * dx + dy * dy;
       if (distance < nearestDistance) {
         nearestDistance = distance;
@@ -584,8 +819,8 @@ bool findRedBugWaypoint(uint8_t bugIndex, int16_t targetX, int16_t targetY,
   parent[start] = start;
   const int8_t columnOffsets[] = {0, 0, -1, 1};
   const int8_t rowOffsets[] = {
-      static_cast<int8_t>(bugIndex % 2 == 0 ? -1 : 1),
-      static_cast<int8_t>(bugIndex % 2 == 0 ? 1 : -1),
+      static_cast<int8_t>(enemyIndex % 2 == 0 ? -1 : 1),
+      static_cast<int8_t>(enemyIndex % 2 == 0 ? 1 : -1),
       0,
       0,
   };
@@ -619,11 +854,11 @@ bool findRedBugWaypoint(uint8_t bugIndex, int16_t targetX, int16_t targetY,
   return true;
 }
 
-bool bugsCollided() {
-  for (uint8_t i = 0; i < redBugCount; ++i) {
-    const int16_t dx = greenX - redBugs[i].x;
-    const int16_t dy = greenY - redBugs[i].y;
-    if (dx * dx + dy * dy <= 24 * 24) return true;
+bool enemiesCollided() {
+  for (uint8_t i = 0; i < enemyCount; ++i) {
+    const int16_t dx = greenX - enemies[i].x;
+    const int16_t dy = greenY - enemies[i].y;
+    if (dx * dx + dy * dy <= 25 * 25) return true;
   }
   return false;
 }
@@ -656,8 +891,8 @@ void randomizeWalls() {
       };
       if ((abs(candidate.x - greenX) < 48 &&
            abs(candidate.y + candidate.height / 2 - greenY) < 48) ||
-          (abs(candidate.x - redBugs[0].x) < 48 &&
-           abs(candidate.y + candidate.height / 2 - redBugs[0].y) < 48)) {
+          (abs(candidate.x - enemies[0].x) < 48 &&
+           abs(candidate.y + candidate.height / 2 - enemies[0].y) < 48)) {
         continue;
       }
 
@@ -684,12 +919,12 @@ void randomizeWalls() {
   }
 }
 
-void spawnRedBug() {
-  if (redBugCount >= MAX_RED_BUGS) {
+void spawnEnemy() {
+  if (enemyCount >= MAX_ENEMIES) {
     return;
   }
 
-  RedBug &bug = redBugs[redBugCount];
+  Enemy &enemy = enemies[enemyCount];
   bool placed = false;
   for (uint16_t attempt = 0; attempt < 160; ++attempt) {
     const int16_t x = random(24, tft.width() - 24);
@@ -698,16 +933,16 @@ void spawnRedBug() {
       continue;
     }
     bool overlapsBug = false;
-    for (uint8_t i = 0; i < redBugCount; ++i) {
-      if (abs(x - redBugs[i].x) < RED_BUG_MIN_DX &&
-          abs(y - redBugs[i].y) < RED_BUG_MIN_DY) {
+    for (uint8_t i = 0; i < enemyCount; ++i) {
+      if (abs(x - enemies[i].x) < ENEMY_MIN_DX &&
+          abs(y - enemies[i].y) < ENEMY_MIN_DY) {
         overlapsBug = true;
         break;
       }
     }
     if (!overlapsBug) {
-      bug.x = x;
-      bug.y = y;
+      enemy.x = x;
+      enemy.y = y;
       placed = true;
       break;
     }
@@ -717,10 +952,31 @@ void spawnRedBug() {
     Serial.println("No free space for a new bug.");
     return;
   }
-  bug.lastMove = millis();
-  bug.boostUntil = 0;
-  ++redBugCount;
-  Serial.printf("A new red bug is following you (%u).\n", redBugCount);
+  enemy.lastMove = millis();
+  enemy.lastAnimationAt = enemy.lastMove;
+  enemy.boostUntil = 0;
+  enemy.specialUntil = 0;
+  const uint32_t now = millis();
+  switch (static_cast<EnemyType>(enemyCount)) {
+  case EnemyType::Fox:
+    enemy.nextSpecialAt = now + 1800;
+    break;
+  case EnemyType::Skunk:
+    enemy.nextSpecialAt = now + 3200;
+    break;
+  case EnemyType::Snake:
+    enemy.nextSpecialAt = now + 2400;
+    break;
+  default:
+    enemy.nextSpecialAt = 0;
+    break;
+  }
+  enemy.animationFrame = 0;
+  enemy.type = static_cast<EnemyType>(enemyCount);
+  enemy.specialActive = false;
+  enemy.facingRight = enemy.x < greenX;
+  ++enemyCount;
+  Serial.printf("A new enemy joined the chase (%u).\n", enemyCount);
 }
 
 void placeCrumb(Crumb &crumb) {
@@ -729,8 +985,8 @@ void placeCrumb(Crumb &crumb) {
     const int16_t y = random(34, tft.height() - 18);
     if (pointHitsWall(x, y) || abs(x - greenX) < 30 || abs(y - greenY) < 24) continue;
     bool tooCloseToRed = false;
-    for (uint8_t i = 0; i < redBugCount; ++i) {
-      if (abs(x - redBugs[i].x) < 30 || abs(y - redBugs[i].y) < 24) {
+    for (uint8_t i = 0; i < enemyCount; ++i) {
+      if (abs(x - enemies[i].x) < 30 || abs(y - enemies[i].y) < 24) {
         tooCloseToRed = true;
         break;
       }
@@ -767,7 +1023,7 @@ void showWinScreen() {
   tft.setCursor(25, 20);
   tft.print("You Win!");
   drawWinDance();
-  drawRestartButton();
+  drawMenuButton();
   drawVolumeControls();
   lastWinDance = millis();
 }
@@ -782,32 +1038,34 @@ void collectCrumbs(uint32_t now) {
       continue;
     }
 
-    uint32_t *boostUntil = nullptr;
-    if (abs(greenX - crumb.x) <= 14 && abs(greenY - crumb.y) <= 12) {
-      boostUntil = &greenBoostUntil;
-    } else {
-      for (uint8_t i = 0; i < redBugCount; ++i) {
-        if (abs(redBugs[i].x - crumb.x) <= 14 && abs(redBugs[i].y - crumb.y) <= 12) {
-          boostUntil = &redBugs[i].boostUntil;
-          break;
-        }
-      }
-      if (boostUntil == nullptr) continue;
+    if (abs(greenX - crumb.x) > 14 || abs(greenY - crumb.y) > 12) {
+      continue;
     }
 
     crumb.active = false;
-    *boostUntil = now + 2000;
-    ++crumbsCollected;
+    const bool boostStillActive =
+        static_cast<int32_t>(greenBoostUntil - now) > 0;
+    greenBoostUntil =
+        (boostStillActive ? greenBoostUntil : now) + 4000;
+    if (crumbsCollected < UINT32_MAX) {
+      ++crumbsCollected;
+    }
     playCrumbSound();
-    Serial.printf("Bread collected: %u/21\n", crumbsCollected);
+    if (gameMode == GameMode::Endless) {
+      Serial.printf("Bread collected: %lu\n",
+                    static_cast<unsigned long>(crumbsCollected));
+    } else {
+      Serial.printf("Bread collected: %lu/21\n",
+                    static_cast<unsigned long>(crumbsCollected));
+    }
 
-    if (crumbsCollected >= 21) {
+    if (gameMode == GameMode::Classic && crumbsCollected >= 21) {
       showWinScreen();
       return;
     }
 
-    if (crumbsCollected % 5 == 0) {
-      spawnRedBug();
+    if (crumbsCollected % 4 == 0) {
+      spawnEnemy();
     }
 
     placeCrumb(crumb);
@@ -923,6 +1181,7 @@ void setup() {
   touch.setRotation(1);
   preferences.begin("cyd-touch", false);
   volumePercent = constrain(preferences.getUChar("volume", 50), 0, 100);
+  endlessHighScore = preferences.getULong("endlessBest", 0);
   if (ledcSetup(BUZZER_CHANNEL, 2000, 10) == 0) {
     Serial.println("Issue: Buzzer PWM could not be initialized.");
   } else {
@@ -940,7 +1199,7 @@ void setup() {
 
   Serial.println("Game ready: Touch the screen to control the green bug.");
   randomSeed(esp_random());
-  resetGame();
+  showMainMenu();
 }
 
 void loop() {
@@ -950,8 +1209,33 @@ void loop() {
     const char command = Serial.read();
     if (command == 'c' || command == 'C') {
       calibrateTouch();
-      drawScene();
+      if (inMainMenu) {
+        showMainMenu();
+      } else {
+        drawScene();
+      }
     }
+  }
+
+  if (inMainMenu) {
+    const bool isTouching = touch.touched();
+    if (isTouching && !touchWasDown) {
+      const TS_Point point = touch.getPoint();
+      const int16_t x = mapTouchCoordinate(point.x, touchCalibration.xLeft,
+                                          touchCalibration.xRight, tft.width());
+      const int16_t y = mapTouchCoordinate(point.y, touchCalibration.yTop,
+                                          touchCalibration.yBottom, tft.height());
+      if (!handleVolumeTouch(x, y) && x >= 55 && x <= 265) {
+        if (y >= 92 && y <= 134) {
+          resetGame(GameMode::Classic);
+        } else if (y >= 142 && y <= 184) {
+          resetGame(GameMode::Endless);
+        }
+      }
+    }
+    touchWasDown = isTouching;
+    delay(5);
+    return;
   }
 
   if (caught) {
@@ -968,7 +1252,7 @@ void loop() {
       const int16_t y = mapTouchCoordinate(point.y, touchCalibration.yTop,
                                           touchCalibration.yBottom, tft.height());
       if (!handleVolumeTouch(x, y) && x >= 55 && x <= 265 && y >= 155 && y <= 215) {
-        resetGame();
+        showMainMenu();
       }
     }
     touchWasDown = isTouching;
@@ -998,18 +1282,75 @@ void loop() {
   const uint32_t now = millis();
   const int16_t oldGreenX = greenX;
   const int16_t oldGreenY = greenY;
-  const uint8_t oldRedCount = redBugCount;
-  int16_t oldRedX[MAX_RED_BUGS];
-  int16_t oldRedY[MAX_RED_BUGS];
-  for (uint8_t i = 0; i < oldRedCount; ++i) {
-    oldRedX[i] = redBugs[i].x;
-    oldRedY[i] = redBugs[i].y;
+  const uint8_t oldEnemyCount = enemyCount;
+  int16_t oldEnemyX[MAX_ENEMIES];
+  int16_t oldEnemyY[MAX_ENEMIES];
+  for (uint8_t i = 0; i < oldEnemyCount; ++i) {
+    oldEnemyX[i] = enemies[i].x;
+    oldEnemyY[i] = enemies[i].y;
   }
   bool moved = false;
-  const uint32_t greenInterval = static_cast<int32_t>(greenBoostUntil - now) > 0 ? 9 : 15;
+  const bool pandaBoostActive =
+      static_cast<int32_t>(greenBoostUntil - now) > 0;
+  if (pandaBoostActive != pandaBoostVisualActive) {
+    pandaBoostVisualActive = pandaBoostActive;
+    moved = true;
+  }
+  bool pandaInStinkCloud = false;
+  for (uint8_t i = 0; i < enemyCount; ++i) {
+    Enemy &enemy = enemies[i];
+    const bool active = enemy.specialUntil != 0 &&
+                        static_cast<int32_t>(enemy.specialUntil - now) > 0;
+    if (enemy.specialActive != active) {
+      enemy.specialActive = active;
+      moved = true;
+    }
+    if (!active) {
+      enemy.specialUntil = 0;
+    }
+
+    const int16_t dx = greenX - enemy.x;
+    const int16_t dy = greenY - enemy.y;
+    const int32_t distanceSquared = dx * dx + dy * dy;
+    if (enemy.type == EnemyType::Skunk && active &&
+        distanceSquared <= 48 * 48) {
+      pandaInStinkCloud = true;
+    }
+
+    if (enemy.type == EnemyType::Fox || enemy.type == EnemyType::Skunk ||
+        enemy.type == EnemyType::Snake) {
+      const int16_t triggerDistance =
+          enemy.type == EnemyType::Skunk ? 82 : 125;
+      if (!active &&
+          static_cast<int32_t>(now - enemy.nextSpecialAt) >= 0 &&
+          distanceSquared <= triggerDistance * triggerDistance) {
+        const uint32_t duration =
+            enemy.type == EnemyType::Fox ? 650 :
+            enemy.type == EnemyType::Skunk ? 1300 : 500;
+        const uint32_t cooldown =
+            enemy.type == EnemyType::Fox ? 3600 :
+            enemy.type == EnemyType::Skunk ? 5200 : 3000;
+        enemy.specialUntil = now + duration;
+        enemy.nextSpecialAt = now + cooldown;
+        enemy.specialActive = true;
+        moved = true;
+        if (enemy.type == EnemyType::Skunk && distanceSquared <= 48 * 48) {
+          pandaInStinkCloud = true;
+        }
+      }
+    }
+  }
+
+  const uint32_t greenInterval =
+      pandaInStinkCloud ? 30 :
+      static_cast<int32_t>(greenBoostUntil - now) > 0 ? 4 : 13;
   if (now - lastGreenMove >= greenInterval && (greenX != targetX || greenY != targetY)) {
     lastGreenMove = now;
+    const int16_t previousGreenX = greenX;
     if (moveBugToward(greenX, greenY, targetX, targetY)) {
+      if (greenX != previousGreenX) {
+        greenFacingRight = greenX > previousGreenX;
+      }
       if (now - lastPandaAnimationAt >= 110) {
         ++pandaAnimationFrame;
         lastPandaAnimationAt = now;
@@ -1017,22 +1358,49 @@ void loop() {
       moved = true;
     }
   }
-  for (uint8_t i = 0; i < redBugCount; ++i) {
-    const uint32_t redInterval =
-        static_cast<int32_t>(redBugs[i].boostUntil - now) > 0
-            ? 18 + i * 2
-            : 40 + i * 4;
-    const int16_t redTargetX = constrain(
-        greenX + RED_BUG_TARGET_OFFSET_X[i], 20, tft.width() - 20);
-    const int16_t redTargetY = constrain(
-        greenY + RED_BUG_TARGET_OFFSET_Y[i], 20, tft.height() - 20);
-    if (now - redBugs[i].lastMove >= redInterval &&
-        (redBugs[i].x != redTargetX || redBugs[i].y != redTargetY)) {
-      redBugs[i].lastMove = now;
+  for (uint8_t i = 0; i < enemyCount; ++i) {
+    Enemy &enemy = enemies[i];
+    uint32_t enemyInterval = 10 + i;
+    switch (enemy.type) {
+    case EnemyType::Bee:
+      break;
+    case EnemyType::Fox:
+      enemyInterval = enemy.specialActive ? 7 : 10;
+      break;
+    case EnemyType::Skunk:
+      enemyInterval = 13;
+      break;
+    case EnemyType::Snake:
+      enemyInterval = enemy.specialActive ? 8 : 11;
+      break;
+    case EnemyType::Caveman:
+      enemyInterval = 12;
+      break;
+    }
+    enemyInterval = (enemyInterval * 125 + 32) / 64;
+    if (static_cast<int32_t>(enemy.boostUntil - now) > 0) {
+      enemyInterval = (enemyInterval * 4 + 2) / 5;
+    }
+    const int16_t enemyTargetX = constrain(
+        greenX + ENEMY_TARGET_OFFSET_X[i], 20, tft.width() - 20);
+    const int16_t enemyTargetY = constrain(
+        greenY + ENEMY_TARGET_OFFSET_Y[i], 20, tft.height() - 20);
+    if (now - enemy.lastMove >= enemyInterval &&
+        (enemy.x != enemyTargetX || enemy.y != enemyTargetY)) {
+      enemy.lastMove = now;
+      const int16_t previousEnemyX = enemy.x;
       int16_t waypointX;
       int16_t waypointY;
-      if (findRedBugWaypoint(i, redTargetX, redTargetY, waypointX, waypointY)) {
-        moved = moveRedBugToward(i, waypointX, waypointY) || moved;
+      if (findEnemyWaypoint(i, enemyTargetX, enemyTargetY, waypointX, waypointY) &&
+          moveEnemyToward(i, waypointX, waypointY)) {
+        if (enemy.x != previousEnemyX) {
+          enemy.facingRight = enemy.x > previousEnemyX;
+        }
+        if (now - enemy.lastAnimationAt >= 100) {
+          ++enemy.animationFrame;
+          enemy.lastAnimationAt = now;
+        }
+        moved = true;
       }
     }
   }
@@ -1045,10 +1413,10 @@ void loop() {
 
   if (moved) {
     eraseBugAt(oldGreenX, oldGreenY);
-    for (uint8_t i = 0; i < oldRedCount; ++i) {
-      eraseBugAt(oldRedX[i], oldRedY[i]);
+    for (uint8_t i = 0; i < oldEnemyCount; ++i) {
+      eraseBugAt(oldEnemyX[i], oldEnemyY[i]);
     }
-    if (redBugCount != oldRedCount) {
+    if (enemyCount != oldEnemyCount) {
       drawScene();
     } else {
     drawWalls();
@@ -1057,7 +1425,7 @@ void loop() {
     drawBugs();
     drawCounter();
     }
-    if (bugsCollided()) {
+    if (enemiesCollided()) {
       startCaughtMelody();
     }
   }
