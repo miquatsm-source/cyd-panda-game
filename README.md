@@ -5,6 +5,8 @@ across a grassy field, collect bread, and avoid beens chasing you. The
 field contains walls, the bees move on their own, and a buzzer plays sound
 effects and music.
 
+![CYD Panda Game](CYD_panda_game.png)
+
 ## How to play
 
 - Tap the screen to send panda toward that position.
